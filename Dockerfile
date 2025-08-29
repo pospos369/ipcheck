@@ -7,6 +7,7 @@ COPY . .
 
 ENV SERVER_PORT=3000
 ENV PAGE_TITLE="IP信息查询"
+ENV COPYRIGHT="IP查询服务"
 
 EXPOSE ${SERVER_PORT}
 CMD ["node", "server.js"]
