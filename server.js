@@ -1,20 +1,20 @@
 // 将文件顶部改为ESM导入方式
 import express from 'express';
 import fetch from 'node-fetch';
+import crypto from 'crypto';
 
 const app = express();
 
-// --- 安全与基础设置 ---
-app.set('trust proxy', true); // 仅在有受信代理（Nginx/Cloudflare）时启用
+// --- 基础配置 ---
+app.set('trust proxy', true); // 如果有受信代理（如 Nginx/Cloudflare），建议保留
 
-// 可信主机/来源，避免信任请求头注入
 const PORT = process.env.SERVER_PORT || 3000;
 const TRUSTED_ORIGIN = process.env.TRUSTED_ORIGIN || `http://localhost:${PORT}`;
 
 const PAGE_TITLE = process.env.PAGE_TITLE || 'IP查询';
 const COPYRIGHT = process.env.COPYRIGHT || 'IP查询服务';
 
-// 简易 HTML 转义，防止 XSS
+// HTML 转义，防止 XSS
 const escapeHTML = (val = '') =>
   String(val)
     .replace(/&/g, '&amp;')
@@ -50,20 +50,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- 基础安全响应头（轻量版）---
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('X-Frame-Options', 'DENY');
-  // 简易 CSP（若要加载外域资源，请自行放宽）
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; base-uri 'none'; frame-ancestors 'none'"
-  );
-  next();
-});
-
-// --- IP 提取（首选 req.ip；仅做显示时再抽取 IPv4 映射）---
+// --- IP 提取 ---
 const extractIPv4ForDisplay = (ip = '') => {
   if (ip.startsWith('::ffff:')) return ip.split(':').pop();
   return ip;
@@ -71,22 +58,33 @@ const extractIPv4ForDisplay = (ip = '') => {
 
 // --- 主页 ---
 app.get('/', async (req, res) => {
-  // 获取来源 IP（依赖 trust proxy 设置）
+  // 每次请求生成随机 nonce
+  const nonce = crypto.randomBytes(16).toString('base64');
+
+  // 设置 CSP 响应头，允许本域脚本和带 nonce 的脚本执行
+  res.setHeader(
+    'Content-Security-Policy',
+    `default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'`
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+
+  // 获取来源 IP
   const rawIP = req.ip || '';
   const clientIP = extractIPv4ForDisplay(rawIP) || '未知IP';
 
-  // 1) 封禁名单
+  // 封禁检查
   const until = BLOCKED_IPS.get(clientIP);
   if (until && Date.now() < until) {
     return res.status(403).send('访问被拒绝');
   }
 
-  // 2) UA 检查（统一小写）
-  const userAgentRaw = (req.headers['user-agent'] || '');
+  // UA/Referer 检查
+  const userAgentRaw = req.headers['user-agent'] || '';
   const userAgent = userAgentRaw.toLowerCase();
   const isBot = BOT_AGENTS.some(agent => userAgent.includes(agent));
 
-  // 3) Referer 检查（仅信任与 TRUSTED_ORIGIN 同主）
   const referer = req.headers.referer || '';
   let isSuspiciousReferer = false;
   if (referer) {
@@ -95,7 +93,7 @@ app.get('/', async (req, res) => {
       const trustedURL = new URL(TRUSTED_ORIGIN);
       isSuspiciousReferer = refURL.hostname !== trustedURL.hostname;
     } catch {
-      isSuspiciousReferer = true; // 无法解析的 referer 视为可疑
+      isSuspiciousReferer = true;
     }
   }
 
@@ -104,7 +102,7 @@ app.get('/', async (req, res) => {
     return res.status(403).send('访问被拒绝');
   }
 
-  // 4) curl 纯文本
+  // curl 输出
   const isCurl = userAgent.includes('curl');
   if (isCurl) {
     res.set('Content-Type', 'text/plain; charset=utf-8');
@@ -112,18 +110,17 @@ app.get('/', async (req, res) => {
     return res.send(clientIP);
   }
 
-  // 5) 调用百度开放数据平台（增加超时 & 容错）
+  // 调用百度开放数据平台
   const geoUrl = `http://opendata.baidu.com/api.php?query=${encodeURIComponent(
     clientIP
   )}&co=&resource_id=6006&oe=utf8`;
 
   let geoData = {};
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000); // 5s 超时
+  const timeout = setTimeout(() => controller.abort(), 5000);
 
   try {
     const geoResponse = await fetch(geoUrl, { signal: controller.signal });
-    // 非 2xx 也尝试解析，失败则兜底
     geoData = await geoResponse.json().catch(() => ({}));
   } catch (err) {
     console.error('Geo API 请求失败:', err);
@@ -132,7 +129,7 @@ app.get('/', async (req, res) => {
     clearTimeout(timeout);
   }
 
-  // 6) 解析地理信息
+  // 处理地理信息
   const formatLocation = () => {
     try {
       if (geoData.status !== '0' || !geoData.data?.[0]?.location) return '未知';
@@ -141,7 +138,6 @@ app.get('/', async (req, res) => {
       return '未知';
     }
   };
-
   const formatISP = () => {
     try {
       if (geoData.status !== '0' || !geoData.data?.[0]?.location) return '未知';
@@ -154,12 +150,12 @@ app.get('/', async (req, res) => {
 
   const location = formatLocation();
   const isp = formatISP();
-  const asn = '未知'; // 百度接口不提供 ASN
+  const asn = '未知';
 
-  // 7) 仅使用受信来源构造 curl 命令，避免 Host 注入
-  const curlTarget = TRUSTED_ORIGIN; // e.g. http://localhost:3000 或 https://your.domain
+  // 使用受信主机作为 curl 目标
+  const curlTarget = TRUSTED_ORIGIN;
 
-  // 8) 输出页面（所有可见动态内容均转义）
+  // HTML 输出
   const html = `
   <!DOCTYPE html>
   <html lang="zh-CN">
@@ -245,8 +241,7 @@ app.get('/', async (req, res) => {
         <p>© ${new Date().getFullYear()} ${escapeHTML(COPYRIGHT)}</p>
       </div>
     </div>
-    <script>
-      // 简单复制功能
+    <script nonce="${nonce}">
       (function () {
         var btn = document.getElementById('copyBtn');
         var tips = document.getElementById('copyTips');
